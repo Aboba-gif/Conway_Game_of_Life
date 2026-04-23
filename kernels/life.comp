@@ -1,0 +1,84 @@
+#version 460 core
+
+// =============================================================
+// life.comp — Conway's Game of Life (B3/S23) on toroidal grid.
+// Compute shader, GLSL 4.60 Core Profile.
+//
+// Ping-pong dispatch:
+//   binding=0 : read  (in_cells, previous generation)
+//   binding=1 : write (out_cells, next generation)
+//
+// Host dispatch contract:
+//   glDispatchCompute(ceil(W/16), ceil(H/16), 1)
+//
+// Layout motivation (16x16 = 256 threads/WG):
+//   * Matches warp/wavefront multiples on NVIDIA (32) and AMD (64).
+//   * 256 <= GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS on all tested HW.
+//   * Gives 4x headroom to 1024 limit for future extensions.
+// =============================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// -------------------------------------------------------------
+// SSBOs, std430 layout.
+// Binding indices match glBindBufferBase() on the host.
+// -------------------------------------------------------------
+layout(std430, binding = 0) readonly  buffer InBuffer  { uint in_cells[];  };
+layout(std430, binding = 1) writeonly buffer OutBuffer { uint out_cells[]; };
+
+// -------------------------------------------------------------
+// Grid dimensions uniforms (signed int; Lemma 3.3.2 requires
+// signed semantics for correct negative-index modulo).
+// Location indices match glUniform1i() on the host.
+// -------------------------------------------------------------
+layout(location = 0) uniform int u_width;
+layout(location = 1) uniform int u_height;
+
+// -------------------------------------------------------------
+// index(x, y) : [0,W) x [0,H) -> [0, W*H)
+// Row-major linearization. Precondition: 0 <= x < W, 0 <= y < H.
+// -------------------------------------------------------------
+int index(int x, int y) {
+    return y * u_width + x;
+}
+
+// -------------------------------------------------------------
+// at(x, y) : reads in_cells[(x mod W, y mod H)] with toroidal
+// wraparound. Implements canonical representative via Lemma 3.3.2.
+// -------------------------------------------------------------
+uint at(int x, int y) {
+    int xw = ((x % u_width)  + u_width)  % u_width;
+    int yw = ((y % u_height) + u_height) % u_height;
+    return in_cells[index(xw, yw)];
+}
+
+// -------------------------------------------------------------
+// main: one invocation per logical cell (gid.x, gid.y).
+// -------------------------------------------------------------
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+
+    // Bounds check: dispatch size is ceil(W/16)*16 x ceil(H/16)*16
+    // which may exceed (W, H). Writes out-of-bounds -> undefined behaviour,
+    // so phantom invocations MUST return early.
+    if (x >= u_width || y >= u_height) {
+        return;
+    }
+
+    // Current cell state. Read directly (no wrap needed: in-bounds).
+    uint c = in_cells[index(x, y)];
+
+    // 8-neighborhood (Moore) sum with toroidal wrap.
+    uint n = at(x - 1, y - 1) + at(x,     y - 1) + at(x + 1, y - 1)
+           + at(x - 1, y    )                    + at(x + 1, y    )
+           + at(x - 1, y + 1) + at(x,     y + 1) + at(x + 1, y + 1);
+
+    // B3/S23 rule, branchless form (Lemma 3.3.3):
+    //   survive: c == 1 AND (n == 2 OR n == 3)
+    //   birth:   c == 0 AND n == 3
+    // Equivalent: next = (n == 3) OR (c == 1 AND n == 2)
+    uint next = uint( (n == 3u) || (c == 1u && n == 2u) );
+
+    out_cells[index(x, y)] = next;
+}
